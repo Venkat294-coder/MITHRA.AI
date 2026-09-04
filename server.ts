@@ -174,23 +174,31 @@ async function callGeminiWithFailover(
     systemInstruction?: string;
     responseSchema?: any;
     temperature?: number;
+    preferPro?: boolean;
   }
 ): Promise<{ text: string; modelUsed: string }> {
-  // Allowed models in priority order:
-  // 1. gemini-3.1-flash-lite (High-speed, dedicated capacity, ideal for structured JSON)
-  // 2. gemini-3.6-flash (Latest high-capacity fast engine recommended for all users)
-  // 3. gemini-3.8-flash (Standard fallback)
-  const models = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-3.8-flash",
-  ];
+  // Pro Version Upgrade:
+  // When Pro mode is enabled (default), prioritize gemini-3.1-pro-preview for highest accuracy,
+  // reasoning, and LaTeX math fidelity, smoothly failing over to gemini-3.8-flash and gemini-3.1-flash-lite.
+  const models = params.preferPro !== false
+    ? [
+        "gemini-3.1-pro-preview",
+        "gemini-3.8-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+      ]
+    : [
+        "gemini-3.8-flash",
+        "gemini-3.1-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.1-pro-preview",
+      ];
 
   let lastError: any = null;
 
   for (const model of models) {
     try {
-      console.log(`[Gemini Engine] Querying model ${model}...`);
+      console.log(`[Gemini Engine] Querying model ${model} (preferPro: ${params.preferPro !== false})...`);
 
       const config: any = {
         temperature: params.temperature ?? 0.25,
@@ -205,21 +213,21 @@ async function callGeminiWithFailover(
         config.responseSchema = params.responseSchema;
       }
 
-      // Optimize thinking levels to avoid long thinking token latencies and accelerate output
-      if (model === "gemini-3.1-flash-lite") {
-        config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-      } else if (model === "gemini-3.8-flash") {
+      // Optimize thinking levels to eliminate long "research time" delays and deliver lightning-fast responses
+      if (model === "gemini-3.1-pro-preview") {
         config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+      } else {
+        config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
       }
 
-      // 16-second timeout per model ensures fast failover and stays within serverless ceilings
+      // 12-second timeout per model ensures fast failover without frozen states
       const response = await withTimeout(
         ai.models.generateContent({
           model,
           contents: params.contents,
           config,
         }),
-        16000,
+        12000,
         `generating content with ${model}`
       );
 
@@ -233,55 +241,8 @@ async function callGeminiWithFailover(
     } catch (err: any) {
       lastError = err;
       const errMsg = err?.message || String(err);
-      const isDemandSpike =
-        errMsg.includes("503") ||
-        errMsg.includes("UNAVAILABLE") ||
-        errMsg.includes("high demand") ||
-        errMsg.includes("RESOURCE_EXHAUSTED") ||
-        errMsg.includes("Timeout");
-
-      if (isDemandSpike) {
-        console.log(`[Gemini Engine] ${model} issue detected (${errMsg.slice(0, 70)}...). Smoothly failing over to next model.`);
-        continue;
-      }
-
-      // If it is a connection timeout or network glitch, retry once with a quick timeout
-      try {
-        console.log(`[Gemini Engine] Retrying ${model} after transient glitch...`);
-        await new Promise((resolve) => setTimeout(resolve, 500));
-        const retryConfig: any = {
-          temperature: params.temperature ?? 0.25,
-        };
-        if (params.systemInstruction) retryConfig.systemInstruction = params.systemInstruction;
-        if (params.responseSchema) {
-          retryConfig.responseMimeType = "application/json";
-          retryConfig.responseSchema = params.responseSchema;
-        }
-        if (model === "gemini-3.1-flash-lite" || model === "gemini-flash-latest") {
-          retryConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-        }
-
-        const retryRes = await withTimeout(
-          ai.models.generateContent({
-            model,
-            contents: params.contents,
-            config: retryConfig,
-          }),
-          22000,
-          `retrying content with ${model}`
-        );
-
-        if (retryRes && retryRes.text) {
-          console.log(`[Gemini Engine] Model ${model} succeeded on retry.`);
-          return {
-            text: retryRes.text,
-            modelUsed: model,
-          };
-        }
-      } catch (retryErr: any) {
-        lastError = retryErr;
-        console.log(`[Gemini Engine] ${model} retry unsuccessful, advancing to next model.`);
-      }
+      console.log(`[Gemini Engine] ${model} failed (${errMsg.slice(0, 80)}...). Failing over seamlessly.`);
+      continue;
     }
   }
 
@@ -1571,7 +1532,7 @@ What concept or problem would you like to explore right now?`;
 }
 
 app.post("/api/chat-mithra", async (req, res) => {
-  const { message = "", history = [], fileData } = req.body;
+  const { message = "", history = [], fileData, modelMode = "pro" } = req.body;
 
   if (!message && !fileData) {
     return res.status(400).json({ error: "Message or file attachment is required." });
@@ -1654,19 +1615,21 @@ app.post("/api/chat-mithra", async (req, res) => {
       });
     }
 
-    console.log(`[Mithra Chat] Generating reply for conversation with ${contents.length} turns. Has attachment: ${!!fileData}`);
+    console.log(`[Mithra Chat] Generating reply (Mode: ${modelMode}) for conversation with ${contents.length} turns. Has attachment: ${!!fileData}`);
 
-    // Call Gemini with failover
+    // Call Gemini with failover prioritizing Pro when requested
     const { text, modelUsed } = await callGeminiWithFailover(ai, {
       contents,
       systemInstruction: MITHRA_CHAT_SYSTEM_PROMPT,
-      temperature: 0.5,
+      temperature: 0.35,
+      preferPro: modelMode !== "fast",
     });
 
     res.json({
       success: true,
       reply: text ? text.trim() : getMithraFallbackAnswer(message, fileData),
       modelUsed,
+      modelMode,
     });
   } catch (error: any) {
     console.error("Mithra chat endpoint error, smoothly using pedagogical fallback:", error?.message || error);
@@ -1674,6 +1637,7 @@ app.post("/api/chat-mithra", async (req, res) => {
       success: true,
       reply: getMithraFallbackAnswer(message, fileData),
       modelUsed: "mithra-pedagogical-engine",
+      modelMode,
     });
   }
 });

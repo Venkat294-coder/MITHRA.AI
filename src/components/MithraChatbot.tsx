@@ -8,6 +8,7 @@ import {
   Plus,
   RotateCcw,
   Sparkles,
+  Zap,
   Paperclip,
   Image as ImageIcon,
   FileText,
@@ -30,6 +31,7 @@ export interface ChatMessage {
   role: "user" | "model";
   text: string;
   timestamp: string;
+  modelUsed?: string;
   attachment?: {
     name: string;
     type: string;
@@ -83,6 +85,13 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
   } | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [hasNewResponse, setHasNewResponse] = useState<boolean>(false);
+  const [modelMode, setModelMode] = useState<"pro" | "fast">(() => {
+    try {
+      return (localStorage.getItem("mithra_model_mode") as "pro" | "fast") || "pro";
+    } catch {
+      return "pro";
+    }
+  });
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -249,6 +258,7 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
       const payload: any = {
         message: query,
         history: historyForApi,
+        modelMode,
       };
 
       if (fileToSend) {
@@ -281,6 +291,7 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
           data.reply ||
           "Hello! I am Mithra, your learning companion. How else may I help explain things simply for you today?",
         timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+        modelUsed: data.modelUsed,
       };
 
       setMessages((prev) => [...prev, modelMsg]);
@@ -365,89 +376,122 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
   return (
     <>
       {/* ========================================================
-          1. FLOATING CUTE OWL TRIGGER BUTTON (Elevated & Bigger Size)
+          1. FLOATING OWL TRIGGER BUTTON (Clean, Comfortable, Responsive)
           ======================================================== */}
       <div
-        className={`fixed z-40 flex items-center transition-all duration-300 ${
-          isOpen
-            ? "bottom-6 right-6 opacity-0 pointer-events-none"
-            : "bottom-24 sm:bottom-28 md:bottom-32 right-5 sm:right-8"
+        className={`fixed bottom-5 right-5 sm:bottom-6 sm:right-6 z-40 flex items-center transition-all duration-300 ${
+          isOpen ? "scale-0 opacity-0 pointer-events-none" : "scale-100 opacity-100"
         }`}
       >
-        {/* Visible Attention Badge (Always shown when closed) */}
+        {/* Visible Attention Badge (Compact & Desktop-only to avoid blocking mobile screens) */}
         {!isOpen && (
           <div
             onClick={() => setIsOpen(true)}
-            className="flex items-center gap-2 mr-3.5 px-4 py-2 rounded-full bg-slate-950/95 text-white text-xs sm:text-sm font-bold shadow-2xl backdrop-blur-md cursor-pointer border-2 border-purple-400/80 hover:bg-purple-950 hover:border-purple-300 hover:scale-105 transition-all duration-200 animate-in fade-in slide-in-from-right-3 group"
+            className="hidden sm:flex items-center gap-2 mr-3 px-3.5 py-1.5 rounded-full bg-slate-950/95 text-white text-xs font-semibold shadow-xl backdrop-blur-md cursor-pointer border border-purple-400/60 hover:bg-purple-950 hover:border-purple-300 hover:scale-105 transition-all duration-200 group"
           >
-            <span className="relative flex h-2.5 w-2.5 shrink-0">
+            <span className="relative flex h-2 w-2 shrink-0">
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
             </span>
-            <span className="tracking-wide text-white">Ask Mithra AI</span>
-            <Sparkles className="w-4 h-4 text-amber-300 group-hover:rotate-12 transition-transform shrink-0" />
+            <span className="tracking-wide text-white">Ask Mithra</span>
+            {modelMode === "pro" ? (
+              <span className="px-1.5 py-0.2 rounded text-[10px] bg-amber-400/30 text-amber-200 font-bold border border-amber-300/40">
+                PRO ⚡
+              </span>
+            ) : (
+              <Sparkles className="w-3.5 h-3.5 text-amber-300 group-hover:rotate-12 transition-transform shrink-0" />
+            )}
           </div>
         )}
 
-        {/* Large, High-Contrast Floating Owl Button (Prominent & Visible) */}
+        {/* Floating Owl Trigger Button */}
         <button
           id="mithra-floating-owl-btn"
           onClick={() => setIsOpen(!isOpen)}
           aria-label="Open Mithra AI Chatbot"
-          className="relative group w-18 h-18 sm:w-22 sm:h-22 rounded-full flex items-center justify-center cursor-pointer transition-all duration-300 transform hover:scale-105 active:scale-95 bg-gradient-to-br from-violet-600 via-purple-700 to-indigo-950 border-4 border-purple-300 shadow-[0_12px_36px_rgba(109,40,217,0.55)] hover:shadow-[0_16px_46px_rgba(109,40,217,0.7)]"
+          className="relative group w-14 h-14 sm:w-16 sm:h-16 rounded-full flex items-center justify-center cursor-pointer transition-all duration-300 transform hover:scale-105 active:scale-95 bg-gradient-to-br from-violet-600 via-purple-700 to-indigo-950 border-2 border-purple-300/80 shadow-[0_8px_25px_rgba(109,40,217,0.45)] hover:shadow-[0_12px_32px_rgba(109,40,217,0.6)]"
         >
           {/* Outer gentle ambient pulse ring */}
-          <span className="absolute -inset-2 rounded-full bg-purple-500/30 blur-md group-hover:bg-purple-500/50 transition duration-300 -z-10 animate-pulse"></span>
+          <span className="absolute -inset-1.5 rounded-full bg-purple-500/25 blur-sm group-hover:bg-purple-500/40 transition duration-300 -z-10 animate-pulse"></span>
 
           {/* New message notification badge */}
           {hasNewResponse && !isOpen && (
-            <span className="absolute top-1 right-1 w-4 h-4 bg-emerald-500 border-2 border-white rounded-full animate-bounce"></span>
+            <span className="absolute top-0 right-0 w-3.5 h-3.5 bg-emerald-500 border-2 border-white rounded-full animate-bounce"></span>
           )}
 
           <div className="relative flex items-center justify-center p-1">
-            {/* Cute Owl Logo - Big & High-Resolution */}
-            <MithraOwlLogo size={50} className="sm:hidden drop-shadow-md" />
-            <MithraOwlLogo size={62} className="hidden sm:inline-flex drop-shadow-md" />
+            <MithraOwlLogo size={38} className="sm:hidden drop-shadow-sm" />
+            <MithraOwlLogo size={44} className="hidden sm:inline-flex drop-shadow-sm" />
           </div>
         </button>
       </div>
 
       {/* ========================================================
-          2. CLEAN MODERN CHAT INTERFACE
+          2. CLEAN MODERN CHAT INTERFACE (Smooth & Non-Obstructive)
           ======================================================== */}
       {isOpen && (
         <div
           id="mithra-chat-window"
-          className={`fixed z-50 bg-white shadow-2xl border border-purple-200 flex flex-col transition-all duration-200 overflow-hidden ${
+          className={`fixed z-50 bg-white shadow-2xl border border-purple-200/90 flex flex-col transition-all duration-200 overflow-hidden ${
             isExpanded
-              ? "inset-3 md:inset-6 rounded-3xl"
-              : "bottom-4 sm:bottom-6 right-4 sm:right-6 md:right-8 w-[calc(100vw-2rem)] sm:w-[440px] md:w-[490px] h-[650px] max-h-[calc(100vh-3rem)] rounded-3xl"
+              ? "inset-2 sm:inset-6 rounded-2xl sm:rounded-3xl"
+              : "inset-x-2.5 bottom-2 top-14 sm:inset-auto sm:bottom-5 sm:right-5 sm:w-[460px] sm:h-[630px] sm:max-h-[calc(100vh-3.5rem)] rounded-2xl sm:rounded-3xl"
           }`}
         >
           {/* --- TOP HEADER --- */}
-          <div className="bg-gradient-to-r from-violet-800 via-purple-700 to-indigo-900 text-white px-4 py-3.5 flex items-center justify-between shadow-md shrink-0">
-            <div className="flex items-center gap-3">
+          <div className="bg-gradient-to-r from-violet-850 via-purple-800 to-indigo-950 text-white px-3.5 sm:px-4 py-3 flex items-center justify-between shadow-md shrink-0">
+            <div className="flex items-center gap-2.5 min-w-0">
               {/* Owl Logo in Header */}
-              <div className="w-10 h-10 rounded-2xl bg-white/10 border border-white/20 p-1 flex items-center justify-center shadow-inner">
-                <MithraOwlLogo size={32} />
+              <div className="w-9 h-9 rounded-xl bg-white/10 border border-white/20 p-1 flex items-center justify-center shadow-inner shrink-0">
+                <MithraOwlLogo size={28} />
               </div>
-              <div>
+              <div className="min-w-0">
                 <div className="flex items-center gap-1.5">
-                  <span className="font-bold text-base tracking-tight">Mithra</span>
-                  <span className="px-1.5 py-0.5 rounded-full bg-purple-400/30 text-purple-200 text-[10px] font-bold border border-purple-300/30 flex items-center gap-1">
-                    <Sparkles className="w-2.5 h-2.5 text-amber-300" />
-                    AI Mentor
-                  </span>
+                  <span className="font-bold text-sm sm:text-base tracking-tight truncate">Mithra</span>
+                  {/* Pro / Turbo Mode Toggle Pill Button */}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const next = modelMode === "pro" ? "fast" : "pro";
+                      setModelMode(next);
+                      try {
+                        localStorage.setItem("mithra_model_mode", next);
+                      } catch {}
+                    }}
+                    className={`px-2 py-0.5 rounded-full text-[10px] font-bold border transition-all flex items-center gap-1 cursor-pointer select-none shrink-0 ${
+                      modelMode === "pro"
+                        ? "bg-amber-400/25 text-amber-200 border-amber-300/50 shadow-xs hover:bg-amber-400/35"
+                        : "bg-emerald-400/25 text-emerald-200 border-emerald-300/50 shadow-xs hover:bg-emerald-400/35"
+                    }`}
+                    title={
+                      modelMode === "pro"
+                        ? "Gemini Pro Active (High accuracy & math precision). Click to switch to Turbo Flash."
+                        : "Turbo Flash Active (Instant responses). Click to switch to Gemini Pro."
+                    }
+                  >
+                    {modelMode === "pro" ? (
+                      <>
+                        <Zap className="w-2.5 h-2.5 text-amber-300 fill-amber-300" />
+                        <span>Gemini Pro</span>
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-2.5 h-2.5 text-emerald-300" />
+                        <span>Turbo Flash</span>
+                      </>
+                    )}
+                  </button>
                 </div>
-                <div className="text-[11px] text-purple-200/90 flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-                  <span>Super Intelligent Learning Companion</span>
+                <div className="text-[10px] sm:text-[11px] text-purple-200/85 truncate">
+                  {modelMode === "pro"
+                    ? "Deep reasoning & LaTeX math • Gemini 3.1 Pro"
+                    : "Ultra-fast answers • Gemini 3.8 Flash"}
                 </div>
               </div>
             </div>
 
             {/* Header Control Actions */}
-            <div className="flex items-center gap-1">
+            <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
               {/* Clear History */}
               {messages.length > 0 && (
                 <button
@@ -483,23 +527,32 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
           </div>
 
           {/* --- CHAT MESSAGES AREA (Middle) --- */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gradient-to-b from-purple-50/30 via-slate-50/40 to-white">
+          <div className="flex-1 overflow-y-auto p-3.5 sm:p-4 space-y-4 bg-gradient-to-b from-purple-50/30 via-slate-50/40 to-white">
             {/* EMPTY STATE / WELCOME SCREEN */}
             {messages.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center text-center py-6 px-3 space-y-5 animate-in fade-in duration-300">
+              <div className="h-full flex flex-col items-center justify-center text-center py-6 px-3 space-y-4 animate-in fade-in duration-300">
                 {/* Big Mithra Logo at the top */}
                 <div className="relative p-3 rounded-3xl bg-gradient-to-br from-violet-100 to-purple-50 border border-purple-200 shadow-md">
-                  <MithraOwlLogo size={76} />
+                  <MithraOwlLogo size={70} />
                   <div className="absolute -bottom-1 -right-1 p-1.5 rounded-full bg-purple-700 text-white shadow-xs">
-                    <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                    {modelMode === "pro" ? (
+                      <Zap className="w-3.5 h-3.5 text-amber-300 fill-amber-300" />
+                    ) : (
+                      <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                    )}
                   </div>
                 </div>
 
-                {/* Welcome Typography per User Requirement */}
+                {/* Welcome Typography */}
                 <div className="space-y-1 max-w-sm">
-                  <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">
-                    Welcome to Mithra
-                  </h2>
+                  <div className="flex items-center justify-center gap-1.5">
+                    <h2 className="text-xl font-extrabold text-slate-900 tracking-tight">
+                      Welcome to Mithra
+                    </h2>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-amber-100 text-amber-800 border border-amber-300">
+                      PRO
+                    </span>
+                  </div>
                   <p className="text-xs font-semibold text-purple-700 uppercase tracking-wider">
                     Your Super Intelligent Learning Companion
                   </p>
@@ -510,7 +563,7 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
 
                 {/* Subtitle / Capabilities Note */}
                 <div className="text-[11.5px] text-slate-500 max-w-xs leading-relaxed bg-purple-100/60 p-2.5 rounded-2xl border border-purple-200/80">
-                  Ask any question from any subject, or attach a photo/document! I explain complex topics in the simplest, crystal-clear language.
+                  Ask any question from statistics, economics, math equations, or attach a photo/document! Powered by upgraded Gemini models for swift, crystal-clear answers.
                 </div>
 
                 {/* Quick Starter Suggestions */}
@@ -619,7 +672,7 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
                           </div>
                         )}
 
-                        {/* Timestamp & Copy action */}
+                        {/* Timestamp, Model badge & Copy action */}
                         <div
                           className={`flex items-center gap-2 px-1 text-[10px] text-slate-400 ${
                             isUser ? "justify-end" : "justify-start"
@@ -627,17 +680,26 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
                         >
                           <span>{msg.timestamp}</span>
                           {!isUser && (
-                            <button
-                              onClick={() => copyToClipboard(msg.id, msg.text)}
-                              title="Copy answer"
-                              className="text-slate-400 hover:text-purple-700 transition-colors p-0.5"
-                            >
-                              {copiedMessageId === msg.id ? (
-                                <Check className="w-3 h-3 text-emerald-600" />
-                              ) : (
-                                <Copy className="w-3 h-3" />
-                              )}
-                            </button>
+                            <>
+                              <span className="text-[9.5px] px-1.5 py-0.2 rounded-md bg-purple-100/70 text-purple-700 font-semibold border border-purple-200/60">
+                                {msg.modelUsed?.includes("pro")
+                                  ? "⚡ Gemini Pro"
+                                  : msg.modelUsed?.includes("pedagogical")
+                                  ? "✦ Mithra Core"
+                                  : "🚀 Flash"}
+                              </span>
+                              <button
+                                onClick={() => copyToClipboard(msg.id, msg.text)}
+                                title="Copy answer"
+                                className="text-slate-400 hover:text-purple-700 transition-colors p-0.5"
+                              >
+                                {copiedMessageId === msg.id ? (
+                                  <Check className="w-3 h-3 text-emerald-600" />
+                                ) : (
+                                  <Copy className="w-3 h-3" />
+                                )}
+                              </button>
+                            </>
                           )}
                         </div>
                       </div>
@@ -658,18 +720,28 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
                     <div className="w-8 h-8 rounded-full bg-purple-100 border border-purple-200 p-0.5 flex items-center justify-center shrink-0 mt-0.5 shadow-2xs">
                       <MithraOwlLogo size={24} />
                     </div>
-                    <div className="p-3.5 rounded-2xl rounded-tl-xs bg-white border border-purple-100 shadow-xs space-y-1.5 max-w-[80%]">
+                    <div className="p-3 rounded-2xl rounded-tl-xs bg-white border border-purple-100 shadow-xs space-y-1.5 max-w-[85%]">
                       <div className="flex items-center gap-1.5 text-xs text-purple-700 font-semibold">
-                        <Sparkles className="w-3.5 h-3.5 animate-spin text-amber-500" />
-                        <span>Mithra is thinking...</span>
+                        {modelMode === "pro" ? (
+                          <Zap className="w-3.5 h-3.5 text-amber-500 fill-amber-500 animate-pulse" />
+                        ) : (
+                          <Sparkles className="w-3.5 h-3.5 animate-spin text-purple-500" />
+                        )}
+                        <span>
+                          {modelMode === "pro"
+                            ? "Mithra Pro is reasoning & formulating answer..."
+                            : "Mithra is formulating your answer..."}
+                        </span>
                       </div>
-                      <div className="flex items-center gap-1.5 pl-1 py-1">
+                      <div className="flex items-center gap-1.5 pl-1 py-0.5">
                         <span className="w-2 h-2 rounded-full bg-purple-500 animate-bounce"></span>
                         <span className="w-2 h-2 rounded-full bg-purple-600 animate-bounce [animation-delay:0.2s]"></span>
                         <span className="w-2 h-2 rounded-full bg-purple-700 animate-bounce [animation-delay:0.4s]"></span>
                       </div>
-                      <div className="text-[10px] text-slate-400">
-                        Preparing a simple, crystal-clear explanation for you
+                      <div className="text-[10px] text-slate-500">
+                        {modelMode === "pro"
+                          ? "Executing Gemini Pro engine for highest analytical & mathematical accuracy"
+                          : "Preparing a simple, rapid explanation for you"}
                       </div>
                     </div>
                   </div>
@@ -767,8 +839,12 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
             </div>
 
             {/* Micro Caption */}
-            <div className="text-[10px] text-center text-slate-400 mt-1.5">
-              Mithra explains everything in simple, beginner-friendly steps • Powered by Gemini AI
+            <div className="text-[10.5px] text-center text-slate-500 mt-1.5 flex items-center justify-center gap-1.5">
+              <span className="font-semibold text-purple-700">
+                {modelMode === "pro" ? "⚡ Gemini Pro Mode Active" : "🚀 Turbo Flash Active"}
+              </span>
+              <span>•</span>
+              <span>Press Enter to send (Shift+Enter for newline)</span>
             </div>
           </div>
         </div>
