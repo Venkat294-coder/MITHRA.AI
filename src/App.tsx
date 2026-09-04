@@ -15,6 +15,7 @@ import { StreamlitCodeModal } from "./components/StreamlitCodeModal";
 import { MithraChatbot } from "./components/MithraChatbot";
 import { Quiz, OptionKey, TopicAnalysis, TopicRating } from "./types";
 import { SAMPLE_STATISTICAL_MATERIAL } from "./data/sampleMaterial";
+import { extractTextFromPdfClient } from "./utils/pdfTextExtractor";
 import { Menu, Sparkles, BookOpen, AlertCircle, RefreshCw, Info, X } from "lucide-react";
 
 export default function App() {
@@ -77,82 +78,147 @@ export default function App() {
       let data: any;
 
       if (file) {
-        // High-capacity chunked streaming pipeline for PDFs up to 650 MB
-        // 12 MB chunks safely bypass all reverse proxy limits and avoid client-side memory freezes
-        const CHUNK_SIZE = 12 * 1024 * 1024;
-        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
-        const uploadId = `upl_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-
-        for (let i = 0; i < totalChunks; i++) {
-          const start = i * CHUNK_SIZE;
-          const end = Math.min(file.size, start + CHUNK_SIZE);
-          const chunkBlob = file.slice(start, end);
-
-          const currentPct = Math.round((i / totalChunks) * 100);
-          setUploadProgress(currentPct);
-          const uploadedMb = (start / (1024 * 1024)).toFixed(1);
-          const totalMb = (file.size / (1024 * 1024)).toFixed(1);
-          setLoadingStep(
-            totalChunks > 1
-              ? `Uploading high-capacity PDF: ${currentPct}% (${uploadedMb} MB / ${totalMb} MB, chunk ${i + 1}/${totalChunks})...`
-              : `Uploading PDF (${totalMb} MB)...`
-          );
+        // Strategy 1: For files <= 4 MB (the majority of test papers and notes), use direct single-request upload
+        // This avoids chunk roundtrips, proxy 413 limits, and multi-request serverless cache misses
+        if (file.size <= 4 * 1024 * 1024) {
+          const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+          setUploadProgress(30);
+          setLoadingStep(`Uploading "${file.name}" (${sizeMb} MB) & analyzing statistical syllabus...`);
 
           const formData = new FormData();
-          formData.append("chunk", chunkBlob, file.name);
-          formData.append("uploadId", uploadId);
-          formData.append("chunkIndex", String(i));
-          formData.append("totalChunks", String(totalChunks));
+          formData.append("file", file);
           formData.append("fileName", file.name);
-          formData.append("totalSize", String(file.size));
-
-          let chunkRes: Response | null = null;
-          for (let attempt = 0; attempt < 3; attempt++) {
-            try {
-              chunkRes = await fetch("/api/upload-chunk", {
-                method: "POST",
-                body: formData,
-              });
-              if (chunkRes.ok) break;
-            } catch (netErr) {
-              if (attempt === 2) throw netErr;
-              await new Promise((r) => setTimeout(r, 1000));
-            }
+          formData.append("numQuestions", String(numQuestions));
+          if (base64Data) {
+            formData.append("base64Data", base64Data);
           }
 
-          if (!chunkRes || !chunkRes.ok) {
-            const errData = await chunkRes?.json().catch(() => ({}));
-            throw new Error(errData?.error || `Upload failed on chunk ${i + 1}/${totalChunks}.`);
+          setUploadProgress(60);
+          setLoadingStep(
+            numQuestions === 30
+              ? `Formulating 30 MCQs across 3 parallel AI engines (Theory, Formulas & Competitive Benchmarks)...`
+              : numQuestions === 20
+              ? `Formulating 20 MCQs across dual parallel streams (PDF Concepts + Statistical Benchmark Standards)...`
+              : `Formulating 10 high-yield MCQs (Synthesizing PDF and Official Statistical Benchmarks)...`
+          );
+
+          const genRes = await fetch("/api/generate-quiz", {
+            method: "POST",
+            body: formData,
+          });
+
+          setUploadProgress(100);
+          if (!genRes.ok) {
+            const errData = await genRes.json().catch(() => ({}));
+            throw new Error(errData?.error || "Failed to generate questions from uploaded PDF.");
           }
-        }
 
-        setUploadProgress(100);
-        setLoadingStep(`Assembled document. Analyzing syllabus and statistical chapters...`);
-
-        if (numQuestions === 30) {
-          setLoadingStep(`Formulating 30 MCQs across 3 parallel AI engines (Theory, Formulas & Competitive Benchmarks)...`);
-        } else if (numQuestions === 20) {
-          setLoadingStep(`Formulating 20 MCQs across dual parallel streams (PDF Concepts + Statistical Benchmark Standards)...`);
+          data = await genRes.json();
         } else {
-          setLoadingStep(`Formulating 10 high-yield MCQs (Synthesizing PDF and Official Statistical Benchmarks)...`);
+          // Strategy 2: For larger files (> 4 MB), perform fast client-side parsing first
+          const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
+          setLoadingStep(`Extracting text from high-capacity PDF "${file.name}" (${sizeMb} MB)...`);
+          setUploadProgress(25);
+
+          const clientExtracted = await extractTextFromPdfClient(file);
+
+          if (clientExtracted.text && clientExtracted.text.length >= 150) {
+            setLoadingStep(
+              numQuestions === 30
+                ? `Formulating 30 MCQs from extracted chapters (${clientExtracted.pages} pages)...`
+                : `Formulating ${numQuestions} MCQs from extracted chapters (${clientExtracted.pages} pages)...`
+            );
+            setUploadProgress(70);
+
+            const genRes = await fetch("/api/generate-quiz", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                textContent: clientExtracted.text,
+                fileName: file.name,
+                numQuestions,
+              }),
+            });
+
+            setUploadProgress(100);
+            if (!genRes.ok) {
+              const errData = await genRes.json().catch(() => ({}));
+              throw new Error(errData?.error || "Failed to formulate quiz from extracted text.");
+            }
+            data = await genRes.json();
+          } else {
+            // Strategy 3: Resilient Chunked Streaming with 2 MB chunks (safely below Vercel's 4.5 MB ceiling)
+            const CHUNK_SIZE = 2 * 1024 * 1024;
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const uploadId = `upl_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+
+            for (let i = 0; i < totalChunks; i++) {
+              const start = i * CHUNK_SIZE;
+              const end = Math.min(file.size, start + CHUNK_SIZE);
+              const chunkBlob = file.slice(start, end);
+
+              const currentPct = Math.round((i / totalChunks) * 80);
+              setUploadProgress(currentPct);
+              const uploadedMb = (start / (1024 * 1024)).toFixed(1);
+              setLoadingStep(`Uploading large PDF: ${currentPct}% (${uploadedMb}/${sizeMb} MB, chunk ${i + 1}/${totalChunks})...`);
+
+              const formData = new FormData();
+              formData.append("chunk", chunkBlob, file.name);
+              formData.append("uploadId", uploadId);
+              formData.append("chunkIndex", String(i));
+              formData.append("totalChunks", String(totalChunks));
+              formData.append("fileName", file.name);
+              formData.append("totalSize", String(file.size));
+
+              let chunkRes: Response | null = null;
+              for (let attempt = 0; attempt < 3; attempt++) {
+                try {
+                  chunkRes = await fetch("/api/upload-chunk", {
+                    method: "POST",
+                    body: formData,
+                  });
+                  if (chunkRes.ok) break;
+                } catch (netErr) {
+                  if (attempt === 2) throw netErr;
+                  await new Promise((r) => setTimeout(r, 1000));
+                }
+              }
+
+              if (!chunkRes || !chunkRes.ok) {
+                const errData = await chunkRes?.json().catch(() => ({}));
+                throw new Error(errData?.error || `Upload failed on chunk ${i + 1}/${totalChunks}.`);
+              }
+            }
+
+            setUploadProgress(85);
+            setLoadingStep(
+              numQuestions === 30
+                ? `Formulating 30 MCQs across 3 parallel AI engines (Theory, Formulas & Competitive Benchmarks)...`
+                : numQuestions === 20
+                ? `Formulating 20 MCQs across dual parallel streams (PDF Concepts + Statistical Benchmark Standards)...`
+                : `Formulating 10 high-yield MCQs (Synthesizing PDF and Official Statistical Benchmarks)...`
+            );
+
+            const genRes = await fetch("/api/generate-from-upload", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                uploadId,
+                fileName: file.name,
+                numQuestions,
+                fallbackText: clientExtracted.text || file.name,
+              }),
+            });
+
+            setUploadProgress(100);
+            if (!genRes.ok) {
+              const errData = await genRes.json().catch(() => ({}));
+              throw new Error(errData?.error || `Failed to generate questions from uploaded document.`);
+            }
+
+            data = await genRes.json();
+          }
         }
-
-        const genRes = await fetch("/api/generate-from-upload", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            uploadId,
-            fileName: file.name,
-            numQuestions,
-          }),
-        });
-
-        if (!genRes.ok) {
-          const errData = await genRes.json().catch(() => ({}));
-          throw new Error(errData?.error || `Failed to generate questions from uploaded document.`);
-        }
-
-        data = await genRes.json();
       } else {
         // Direct textContent or sample material
         if (numQuestions === 30) {
