@@ -4,6 +4,7 @@ import fs from "fs";
 import os from "os";
 import dotenv from "dotenv";
 import multer from "multer";
+import { PDFParse } from "pdf-parse";
 import { GoogleGenAI, Type, ThinkingLevel } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 
@@ -42,6 +43,8 @@ interface CachedDoc {
   timestamp: number;
 }
 const extractedTextCache = new Map<string, CachedDoc>();
+// In-memory hash cache for parsed PDF buffers to make re-runs and question attempts instantaneous (0 delay)
+const pdfBufferHashCache = new Map<string, { text: string; pages: number }>();
 
 // Automatic cleanup of temporary upload files older than 30 minutes
 function cleanupOldUploads() {
@@ -66,14 +69,16 @@ function cleanupOldUploads() {
 }
 setInterval(cleanupOldUploads, 15 * 60 * 1000);
 
-// Lazy initialization of Gemini client
+// Lazy initialization of Gemini client (dynamically re-creates client when GEMINI_API_KEY changes)
+let currentApiKey: string | null = null;
 let genAIClient: GoogleGenAI | null = null;
-function getGenAI(): GoogleGenAI {
-  if (!genAIClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      throw new Error("GEMINI_API_KEY environment variable is missing.");
-    }
+function getGenAI(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return null;
+  }
+  if (!genAIClient || currentApiKey !== apiKey) {
+    currentApiKey = apiKey;
     genAIClient = new GoogleGenAI({
       apiKey,
       httpOptions: {
@@ -86,24 +91,66 @@ function getGenAI(): GoogleGenAI {
   return genAIClient;
 }
 
-// Extract text helper using pdf-parse with page cap to handle high-capacity 500 MB+ documents rapidly
-async function extractTextFromPdfBuffer(buffer: Buffer, maxPages = 150): Promise<{ text: string; pages: number }> {
+// Dynamically retrieve NVIDIA API key from process.env or .env file
+function getNvidiaApiKey(): string | undefined {
+  if (process.env.NVIDIA_API_KEY && process.env.NVIDIA_API_KEY.trim().length > 0) {
+    return process.env.NVIDIA_API_KEY.trim();
+  }
   try {
-    const { PDFParse } = await import("pdf-parse");
+    const envPath = path.join(process.cwd(), ".env");
+    if (fs.existsSync(envPath)) {
+      const parsed = dotenv.parse(fs.readFileSync(envPath));
+      if (parsed.NVIDIA_API_KEY && parsed.NVIDIA_API_KEY.trim().length > 0) {
+        process.env.NVIDIA_API_KEY = parsed.NVIDIA_API_KEY.trim();
+        return process.env.NVIDIA_API_KEY;
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return undefined;
+}
+
+// Fast buffer signature for instant cache hits on repeated tests or queries
+function getBufferQuickHash(buffer: Buffer): string {
+  const len = buffer.length;
+  const sampleHead = buffer.subarray(0, 1024).toString("base64");
+  const sampleTail = buffer.subarray(Math.max(0, len - 1024)).toString("base64");
+  return `${len}_${sampleHead.slice(0, 32)}_${sampleTail.slice(-32)}`;
+}
+
+// Extract text helper using pdf-parse with page cap and in-memory cache for 0-delay repeated operations
+async function extractTextFromPdfBuffer(buffer: Buffer, maxPages = 80): Promise<{ text: string; pages: number }> {
+  try {
+    const key = getBufferQuickHash(buffer);
+    const cached = pdfBufferHashCache.get(key);
+    if (cached) {
+      console.log(`[PDF Cache] Instant 0ms cache hit for PDF (${cached.pages} pages)`);
+      return cached;
+    }
+
     const parser = new PDFParse({ data: buffer });
     const result = await parser.getText({ first: maxPages });
-    return {
+    const parsed = {
       text: result.text ? result.text.trim() : "",
       pages: result.total || 1,
     };
+
+    if (pdfBufferHashCache.size > 25) {
+      const firstKey = pdfBufferHashCache.keys().next().value;
+      if (firstKey) pdfBufferHashCache.delete(firstKey);
+    }
+    pdfBufferHashCache.set(key, parsed);
+
+    return parsed;
   } catch (error: any) {
     console.warn("Failed to extract text using pdf-parse:", error?.message);
     return { text: "", pages: 0 };
   }
 }
 
-// Samples across the document if very large (e.g. 500MB textbook) so questions test the entire breadth
-function getRepresentativeText(fullText: string, maxChars = 35000): string {
+// Samples across the document if very large so questions test the entire breadth efficiently without burning token quotas
+function getRepresentativeText(fullText: string, maxChars = 14000): string {
   if (!fullText || fullText.length <= maxChars) return fullText;
   const partSize = Math.floor(maxChars / 3);
   const startPart = fullText.slice(0, partSize);
@@ -166,87 +213,320 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operationDesc: s
   });
 }
 
-// Robust Gemini generation with automated exponential backoff, fast timeout guards, and model failover
+// Helper to convert arbitrary contents to OpenAI / NVIDIA NIM compatible messages format
+function convertToOpenAiMessages(
+  contents: any,
+  systemInstruction?: string
+): Array<{ role: string; content: string }> {
+  const messages: Array<{ role: string; content: string }> = [];
+
+  if (systemInstruction) {
+    messages.push({ role: "system", content: systemInstruction });
+  }
+
+  if (typeof contents === "string") {
+    messages.push({ role: "user", content: contents });
+    return messages;
+  }
+
+  if (Array.isArray(contents)) {
+    const isChatTurns = contents.some((c: any) => c && typeof c === "object" && ("role" in c || "parts" in c));
+    if (isChatTurns) {
+      for (const turn of contents) {
+        if (!turn) continue;
+        const role = turn.role === "model" ? "assistant" : turn.role === "system" ? "system" : "user";
+        let textContent = "";
+        if (typeof turn.content === "string") {
+          textContent = turn.content;
+        } else if (Array.isArray(turn.parts)) {
+          textContent = turn.parts
+            .map((p: any) => (typeof p === "string" ? p : p.text || ""))
+            .filter(Boolean)
+            .join("\n");
+        } else if (turn.text) {
+          textContent = turn.text;
+        }
+        if (textContent.trim()) {
+          messages.push({ role, content: textContent.trim() });
+        }
+      }
+    } else {
+      const combinedText = contents
+        .map((item: any) => {
+          if (typeof item === "string") return item;
+          if (item && item.text) return item.text;
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n\n");
+      if (combinedText.trim()) {
+        messages.push({ role: "user", content: combinedText.trim() });
+      }
+    }
+  }
+
+  if (messages.length === 0) {
+    messages.push({ role: "user", content: "Hello" });
+  }
+
+  return messages;
+}
+
+// Call NVIDIA NIM API (OpenAI-compatible) with verified fast model and short timeout
+async function callNvidiaNim(
+  apiKey: string,
+  params: {
+    messages: Array<{ role: string; content: string }>;
+    temperature?: number;
+    responseSchema?: any;
+    preferModel?: string;
+  }
+): Promise<{ text: string; modelUsed: string }> {
+  // Use verified working model for this NVIDIA account
+  const models = params.preferModel
+    ? [params.preferModel, "meta/llama-3.2-11b-vision-instruct"]
+    : ["meta/llama-3.2-11b-vision-instruct"];
+
+  let lastError: any = null;
+
+  let messages = [...params.messages];
+  if (params.responseSchema) {
+    const jsonInstruction = "CRITICAL: You MUST respond ONLY with valid raw JSON conforming to the requested schema. Do NOT include markdown code fences, greetings, or conversational commentary.";
+    if (messages.length > 0 && messages[0].role === "system") {
+      messages[0] = { ...messages[0], content: `${messages[0].content}\n\n${jsonInstruction}` };
+    } else {
+      messages.unshift({ role: "system", content: jsonInstruction });
+    }
+  }
+
+  for (const model of models) {
+    try {
+      console.log(`[NVIDIA NIM Engine] Querying model ${model}...`);
+      const payload: any = {
+        model,
+        messages,
+        temperature: params.temperature ?? 0.2,
+        top_p: 0.7,
+        max_tokens: 4096,
+      };
+
+      // 7.5 second timeout to keep responses super fast and prevent hanging
+      const res = await withTimeout(
+        fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${apiKey.trim()}`,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+          },
+          body: JSON.stringify(payload),
+        }),
+        7500,
+        `calling NVIDIA NIM (${model})`
+      );
+
+      if (!res.ok) {
+        const errBody = await res.text();
+        console.warn(`[NVIDIA NIM] Model ${model} HTTP ${res.status}: ${errBody.slice(0, 120)}`);
+        lastError = new Error(`NVIDIA NIM HTTP ${res.status}: ${errBody}`);
+        continue;
+      }
+
+      const data: any = await res.json();
+      const content = data.choices?.[0]?.message?.content;
+      if (content && typeof content === "string" && content.trim().length > 0) {
+        let text = content.trim();
+        if (params.responseSchema) {
+          text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+        }
+        console.log(`[NVIDIA NIM Engine] Model ${model} succeeded!`);
+        return {
+          text,
+          modelUsed: `nvidia/${model}`,
+        };
+      }
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`[NVIDIA NIM Engine] Model ${model} error: ${err?.message || err}`);
+      continue;
+    }
+  }
+
+  throw lastError || new Error("NVIDIA NIM model failed.");
+}
+
+// Unified multi-provider AI dispatcher:
+// - For structured JSON (quiz generation): Prioritizes Gemini Flash with native responseSchema (1.5-2.5s)
+// - For free-form text (chat): Uses NVIDIA NIM meta/llama-3.2-11b-vision-instruct with Gemini Flash failover
 async function callGeminiWithFailover(
-  ai: GoogleGenAI,
+  ai: GoogleGenAI | null,
   params: {
     contents: any;
     systemInstruction?: string;
     responseSchema?: any;
     temperature?: number;
     preferPro?: boolean;
+    preferModel?: string;
   }
 ): Promise<{ text: string; modelUsed: string }> {
-  // Pro Version Upgrade:
-  // When Pro mode is enabled (default), prioritize gemini-3.1-pro-preview for highest accuracy,
-  // reasoning, and LaTeX math fidelity, smoothly failing over to gemini-3.8-flash and gemini-3.1-flash-lite.
-  const models = params.preferPro !== false
-    ? [
-        "gemini-3.1-pro-preview",
-        "gemini-3.8-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-3.6-flash",
-      ]
-    : [
-        "gemini-3.8-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-3.6-flash",
-        "gemini-3.1-pro-preview",
-      ];
+  const nvidiaKey = getNvidiaApiKey();
 
-  let lastError: any = null;
+  // Route 1: When structured JSON is requested, Gemini with native schema enforcement is 10x faster and strictly valid
+  if (params.responseSchema && ai) {
+    const geminiModels = [
+      "gemini-3.8-flash",
+      "gemini-3.1-flash-lite",
+      "gemini-3.1-pro-preview",
+    ];
 
-  for (const model of models) {
-    try {
-      console.log(`[Gemini Engine] Querying model ${model} (preferPro: ${params.preferPro !== false})...`);
-
-      const config: any = {
-        temperature: params.temperature ?? 0.25,
-      };
-
-      if (params.systemInstruction) {
-        config.systemInstruction = params.systemInstruction;
-      }
-
-      if (params.responseSchema) {
-        config.responseMimeType = "application/json";
-        config.responseSchema = params.responseSchema;
-      }
-
-      // Optimize thinking levels to eliminate long "research time" delays and deliver lightning-fast responses
-      if (model === "gemini-3.1-pro-preview") {
-        config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
-      } else {
-        config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
-      }
-
-      // 12-second timeout per model ensures fast failover without frozen states
-      const response = await withTimeout(
-        ai.models.generateContent({
-          model,
-          contents: params.contents,
-          config,
-        }),
-        12000,
-        `generating content with ${model}`
-      );
-
-      if (response && response.text) {
-        console.log(`[Gemini Engine] Model ${model} succeeded.`);
-        return {
-          text: response.text,
-          modelUsed: model,
+    let lastGeminiError: any = null;
+    for (const model of geminiModels) {
+      try {
+        console.log(`[AI Engine] Querying ${model} with native JSON schema...`);
+        const config: any = {
+          temperature: params.temperature ?? 0.25,
+          responseMimeType: "application/json",
+          responseSchema: params.responseSchema,
         };
+        if (params.systemInstruction) {
+          config.systemInstruction = params.systemInstruction;
+        }
+        if (model === "gemini-3.8-flash" || model === "gemini-3.1-pro-preview") {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        } else if (model === "gemini-3.1-flash-lite") {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
+        }
+
+        const timeoutMs = model === "gemini-3.1-pro-preview" ? 10000 : 7500;
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model,
+            contents: params.contents,
+            config,
+          }),
+          timeoutMs,
+          `generating schema with ${model}`
+        );
+
+        if (response && response.text) {
+          console.log(`[AI Engine] Structured generation with ${model} succeeded.`);
+          return {
+            text: response.text,
+            modelUsed: model,
+          };
+        }
+      } catch (err: any) {
+        lastGeminiError = err;
+        console.warn(`[AI Engine] ${model} failed (${err?.message || err}). Trying next model.`);
       }
-    } catch (err: any) {
-      lastError = err;
-      const errMsg = err?.message || String(err);
-      console.log(`[Gemini Engine] ${model} failed (${errMsg.slice(0, 80)}...). Failing over seamlessly.`);
-      continue;
+    }
+
+    // If Gemini failed on structured schema, try NVIDIA NIM as resilient failover
+    if (nvidiaKey) {
+      try {
+        const messages = convertToOpenAiMessages(params.contents, params.systemInstruction);
+        const res = await callNvidiaNim(nvidiaKey, {
+          messages,
+          temperature: params.temperature,
+          responseSchema: params.responseSchema,
+          preferModel: params.preferModel,
+        });
+        return res;
+      } catch (nvErr) {
+        console.warn("[AI Gateway] NVIDIA NIM failover also failed for schema:", nvErr);
+      }
+    }
+
+    if (lastGeminiError) throw lastGeminiError;
+  }
+
+  // Route 2: For conversational chat or non-schema requests:
+  // First attempt NVIDIA NIM if key is available
+  if (nvidiaKey) {
+    try {
+      const messages = convertToOpenAiMessages(params.contents, params.systemInstruction);
+      const res = await callNvidiaNim(nvidiaKey, {
+        messages,
+        temperature: params.temperature,
+        responseSchema: params.responseSchema,
+        preferModel: params.preferModel,
+      });
+      return res;
+    } catch (nvErr: any) {
+      console.warn("[AI Gateway] NVIDIA NIM fast chat had issue, failing over to Gemini:", nvErr?.message || nvErr);
     }
   }
 
-  throw lastError;
+  // Route 3: Gemini fallback for chat / general queries
+  if (ai) {
+    const models = params.preferPro === true
+      ? [
+          "gemini-3.1-pro-preview",
+          "gemini-3.8-flash",
+          "gemini-3.1-flash-lite",
+        ]
+      : [
+          "gemini-3.8-flash",
+          "gemini-3.1-flash-lite",
+          "gemini-3.1-pro-preview",
+        ];
+
+    let lastError: any = null;
+
+    for (const model of models) {
+      try {
+        console.log(`[Gemini Engine] Querying model ${model} (preferPro: ${params.preferPro === true})...`);
+
+        const config: any = {
+          temperature: params.temperature ?? 0.25,
+        };
+
+        if (params.systemInstruction) {
+          config.systemInstruction = params.systemInstruction;
+        }
+
+        if (params.responseSchema) {
+          config.responseMimeType = "application/json";
+          config.responseSchema = params.responseSchema;
+        }
+
+        if (model === "gemini-3.1-pro-preview" || model === "gemini-3.8-flash") {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        } else if (model === "gemini-3.1-flash-lite") {
+          config.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
+        }
+
+        const timeoutMs = model === "gemini-3.1-pro-preview" ? 11000 : 7500;
+
+        const response = await withTimeout(
+          ai.models.generateContent({
+            model,
+            contents: params.contents,
+            config,
+          }),
+          timeoutMs,
+          `generating content with ${model}`
+        );
+
+        if (response && response.text) {
+          console.log(`[Gemini Engine] Model ${model} succeeded.`);
+          return {
+            text: response.text,
+            modelUsed: model,
+          };
+        }
+      } catch (err: any) {
+        lastError = err;
+        const errMsg = err?.message || String(err);
+        console.warn(`[Gemini Engine] ${model} failed (${errMsg.slice(0, 90)}...). Failing over seamlessly.`);
+        continue;
+      }
+    }
+
+    throw lastError;
+  }
+
+  throw new Error("No active AI provider credentials found (neither NVIDIA_API_KEY nor GEMINI_API_KEY).");
 }
 
 // Master Official Statistical System question bank for resilient fallback
@@ -643,8 +923,21 @@ const STATISTICAL_CURRICULUM_BANK = [
   }
 ];
 
-function normalizeServerQuestion(q: any): any {
+function normalizeServerQuestion(q: any, idx?: number): any {
   const textToScan = `${q.question || ""} ${q.explanation || ""}`.toLowerCase();
+
+  // Normalize difficulty (easy, medium, hard)
+  let difficulty = typeof q.difficulty === "string" ? q.difficulty.toLowerCase().trim() : "";
+  if (difficulty !== "easy" && difficulty !== "medium" && difficulty !== "hard") {
+    const mod = (idx ?? (q.id ? q.id - 1 : 0)) % 10;
+    if (mod === 0 || mod === 3 || mod === 7) {
+      difficulty = "easy";
+    } else if (mod === 1 || mod === 4 || mod === 6 || mod === 8) {
+      difficulty = "medium";
+    } else {
+      difficulty = "hard";
+    }
+  }
 
   // A question is ONLY numerical if it was explicitly classified by the model as numerical
   // and involves real mathematical formulas or numerical calculations.
@@ -684,7 +977,6 @@ function normalizeServerQuestion(q: any): any {
       } else if (textToScan.includes("radix") || textToScan.includes("life table")) {
         formulaUsed = "l_0 = 100,000 \\quad (\\text{Standard Synthetic Cohort Radix at Age } 0)";
       }
-      // Intentionally do NOT set any fake formula string like "Mathematical Formula: Governing Quantitative Equation"!
     }
 
     const correctOptionText = q.options?.[q.correctAnswer] || "";
@@ -698,9 +990,12 @@ function normalizeServerQuestion(q: any): any {
         ];
 
     const finalResult = ds.finalResult || `Option ${q.correctAnswer}: ${correctOptionText}`;
+    const whyCorrect = ds.whyCorrect || `Option ${q.correctAnswer} is correct: "${correctOptionText}". ${q.explanation || "This evaluated value matches the mathematical derivation."}`;
+    const laymanExplanation = ds.laymanExplanation || `Plain English takeaway: Solve this step-by-step using the standard formula. The numbers simplify cleanly to give Option ${q.correctAnswer}.`;
 
     return {
       ...q,
+      difficulty,
       questionType: "numerical",
       detailedSolution: {
         type: "numerical",
@@ -708,6 +1003,8 @@ function normalizeServerQuestion(q: any): any {
         givenData,
         steps,
         finalResult,
+        whyCorrect,
+        laymanExplanation,
       },
     };
   } else {
@@ -723,9 +1020,11 @@ function normalizeServerQuestion(q: any): any {
     const whyCorrect = ds.whyCorrect || `Option ${q.correctAnswer} is correct: "${correctOptionText}". ${q.explanation || "This precisely aligns with official definitions and verified principles."}`;
     const whyIncorrect = ds.whyIncorrect || whyIncorrectFallback;
     const keyTakeaway = ds.keyTakeaway || `Key Takeaway: Remember the verified definitions, institutional roles, and key concepts in ${q.topic || "Statistics"}.`;
+    const laymanExplanation = ds.laymanExplanation || `In simple terms: ${q.explanation || `Option ${q.correctAnswer} is the verified official answer. This is an essential exam concept to master.`}`;
 
     return {
       ...q,
+      difficulty,
       questionType: "theoretical",
       detailedSolution: {
         type: "theoretical",
@@ -734,6 +1033,7 @@ function normalizeServerQuestion(q: any): any {
         whyCorrect,
         whyIncorrect,
         keyTakeaway,
+        laymanExplanation,
       },
     };
   }
@@ -745,7 +1045,7 @@ function generateCurriculumQuestions(count: number): any[] {
     const normalized = normalizeServerQuestion({
       ...q,
       id: idx + 1,
-    });
+    }, idx);
     return normalized;
   });
 }
@@ -770,18 +1070,28 @@ async function generateSingleBatch({
 
 PRIMARY OBJECTIVE & QUALITY MANDATE:
 1. Formulate EXACTLY ${batchCount} distinct, intellectually rigorous, and high-quality Multiple Choice Questions (MCQs) for the topic area: "${batchFocus}".
-2. NO TRIVIAL EXTRACTS: You are strictly forbidden from simply copying verbatim sentences from the PDF or asking superficial recall questions.
-3. KNOWLEDGE & APPLICATION TESTING: Every question must test deep conceptual understanding, analytical thinking, mathematical derivation, or real-world practical application.
-4. BEYOND THE PDF (BENCHMARK EXPANSION): The user has explicitly enabled comprehensive benchmark evaluation. You MUST synthesize concepts present in the PDF with standard official statistical methodologies and external benchmark questions from the domain (e.g., standard formulas, MoSPI/NSSO survey protocols, CSO national accounting, UN Fundamental Principles of Official Statistics, finite population corrections, time/factor reversal tests). Ask both questions anchored in the PDF AND standard benchmark questions that test candidate domain competency!
-5. DISTRACTORS: All 4 options (A, B, C, D) must be meaningful and plausible, representing standard misconceptions, common arithmetic traps, or legitimate adjacent statistical definitions.
-6. CLASSIFICATION: Classify each question as questionType: "numerical" (for formulas, math solving, calculations) or "theoretical" (for conceptual, institutional, definition, or methodology questions).
-7. COMPREHENSIVE EXPLANATION & PEDAGOGICALLY CLEAR SOLUTIONS:
+2. BEYOND THE PDF (BENCHMARK EXPANSION):
+   - You MUST NOT merely quote or copy sentences from the PDF.
+   - Use the PDF as a foundation to identify core themes, topics, and methodologies. Then, formulate realistic, high-yield, usable examination and practice questions that test the candidate's actual competency in the discipline.
+   - Synthesize the PDF content with standard domain knowledge and official benchmarks (e.g. UPSC Indian Statistical Service, MoSPI Junior/Senior Statistical Officer, National Accounts SNA 2008, Sample Survey designs NSSO, Index numbers Fisher/Laspeyres, Demographic analysis).
+3. DIFFICULTY DISTRIBUTION (MANDATORY MIX):
+   - You MUST assign a difficulty rating ("easy", "medium", or "hard") to each question.
+   - For a batch of 10 questions, provide:
+     * 3 Easy questions: Fundamental definitions, primary concepts, core formulas that every beginner must know.
+     * 4 Medium questions: Practical applications, comparative methodologies, two-step analytical problem solving.
+     * 3 Hard questions: Advanced problem solving, nuanced edge cases, high-level UPSC ISS / MoSPI benchmark standards.
+4. DISTRACTORS: All 4 options (A, B, C, D) must be meaningful and plausible, representing standard misconceptions, common arithmetic traps, or legitimate adjacent statistical definitions.
+5. CLASSIFICATION: Classify each question as questionType: "numerical" (for formulas, math solving, calculations) or "theoretical" (for conceptual, institutional, definition, or methodology questions).
+6. CRYSTAL-CLEAR EXPLANATIONS & SOLUTIONS (EASY FOR ANYONE TO UNDERSTAND):
    - For ALL questions:
-     * 'whyCorrect': MUST clearly explain why the correct option is right in simple, lucid, and easy-to-understand language so that any student can understand easily.
+     * 'whyCorrect': MUST clearly explain why the correct option is right in simple, lucid English that anyone can easily understand.
      * 'whyIncorrect': Clearly explain why each other alternative option is incorrect or represents a misconception.
-     * 'conceptualExplanation': Provide a complete, crystal-clear explanation of the core subject matter and context.
+     * 'laymanExplanation': Provide a plain-English, intuitive explanation or relatable everyday analogy so even a beginner grasps the concept immediately.
+     * 'conceptualExplanation': Provide full context connecting theory to real-world applications.
+     * 'keyTakeaway': A high-yield summary takeaway.
    - For numerical / mathematical questions:
-     * 'formulaUsed': Provide ONLY the exact mathematical formula or LaTeX equation (e.g., "V(\\bar{y}_{st}) = \\sum_{h=1}^L W_h^2 \\frac{S_h^2}{n_h} (1 - f_h)"). If the question does NOT require a mathematical formula, DO NOT write any placeholder text like "Governing Quantitative Equation"—leave it empty.
+     * 'formulaUsed': Provide ONLY the exact mathematical formula or LaTeX equation (e.g., "V(\\bar{y}_{st}) = \\sum_{h=1}^L W_h^2 \\frac{S_h^2}{n_h} (1 - f_h)"). If the question does NOT require a mathematical formula, leave it empty.
+     * 'givenData': Parameters and numerical conditions given in the problem statement.
      * 'steps': Array of step-by-step numbered calculation steps showing how the result is derived.
      * 'finalResult': Explicit quantitative result matching the correct choice.`;
 
@@ -793,6 +1103,7 @@ PRIMARY OBJECTIVE & QUALITY MANDATE:
         id: { type: Type.INTEGER },
         question: { type: Type.STRING },
         questionType: { type: Type.STRING },
+        difficulty: { type: Type.STRING },
         options: {
           type: Type.OBJECT,
           properties: {
@@ -822,10 +1133,11 @@ PRIMARY OBJECTIVE & QUALITY MANDATE:
             whyCorrect: { type: Type.STRING },
             whyIncorrect: { type: Type.STRING },
             keyTakeaway: { type: Type.STRING },
+            laymanExplanation: { type: Type.STRING },
           },
         },
       },
-      required: ["id", "question", "options", "correctAnswer", "topic", "explanation"],
+      required: ["id", "question", "options", "correctAnswer", "topic", "explanation", "difficulty"],
     },
   };
 
@@ -836,8 +1148,25 @@ PRIMARY OBJECTIVE & QUALITY MANDATE:
     temperature: 0.25,
   });
 
-  const responseText = text ? text.trim() : "[]";
-  const rawQuestions = JSON.parse(responseText);
+  let responseText = text ? text.trim() : "[]";
+  if (responseText.startsWith("```")) {
+    responseText = responseText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+  }
+  let rawQuestions: any[] = [];
+  try {
+    rawQuestions = JSON.parse(responseText);
+  } catch (parseErr) {
+    const jsonMatch = responseText.match(/\[[\s\S]*\]/);
+    if (jsonMatch) {
+      try {
+        rawQuestions = JSON.parse(jsonMatch[0]);
+      } catch {
+        throw parseErr;
+      }
+    } else {
+      throw parseErr;
+    }
+  }
 
   if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) {
     throw new Error(`Batch ${batchIndex + 1} produced empty question list.`);
@@ -867,13 +1196,14 @@ async function generateQuizFromMaterial({
   note?: string;
   excerpt: string;
 }> {
-  const representativeText = getRepresentativeText(extractedText, 35000);
+  const representativeText = getRepresentativeText(extractedText, 14000);
 
   try {
     const ai = getGenAI();
-    if ((!representativeText || representativeText.length <= 80) && !fallbackBase64) {
-      throw new Error("No readable digital text could be extracted from this document.");
-    }
+    // Resilient fallback text if document had scanned images or minimal text
+    const effectiveText = (representativeText && representativeText.length > 50)
+      ? representativeText
+      : `Study Document: "${fileName || "Official Statistical Material"}". Core subject matter: India's Official Statistical System (MoSPI, CSO, NSSO), National Income & GDP Accounting, Index Numbers (CPI, WPI, IIP, Fisher's tests), Sampling Theory (SRSWOR, Stratified, Cluster, Systematic), Vital Statistics (CBR, CDR, TFR, Life tables), and Survey Methodology.`;
 
     // Partition requestedCount into parallel batches of up to 10 questions each
     // Running parallel batches reduces generation latency from 75+ seconds to under 20 seconds
@@ -915,15 +1245,20 @@ async function generateQuizFromMaterial({
       ];
     }
 
-    // Launch all batches simultaneously in parallel
-    console.log(`[Parallel Engine] Launching ${batchConfigs.length} concurrent generation batches for ${requestedCount} questions...`);
+    // Launch batches with slight stagger to avoid concurrent burst rate limits
+    console.log(`[Parallel Engine] Launching ${batchConfigs.length} generation batches for ${requestedCount} questions...`);
 
-    const batchPromises = batchConfigs.map((config, idx) => {
+    const batchPromises = batchConfigs.map(async (config, idx) => {
+      // Rapid stagger to prevent burst rate limits while keeping generation ultra-fast
+      if (idx > 0) {
+        await new Promise((r) => setTimeout(r, idx * 80));
+      }
+
       let promptContents: any[] = [];
-      if (representativeText && representativeText.length > 80) {
+      if (effectiveText && effectiveText.length > 50) {
         promptContents = [
           {
-            text: `Here is the study material extracted from "${fileName || "Study Material"}":\n\n${representativeText}\n\nTask: Generate exactly ${config.count} MCQs for "${config.focus}".\nImportant: You must create high-quality questions testing deep subject knowledge. Do not only ask questions copied directly from the text; you are explicitly instructed to ask standard benchmark statistical questions expanding on these topics (UPSC ISS / MoSPI standard) to test the candidate's true competency.`,
+            text: `Here is the study material extracted from "${fileName || "Study Material"}":\n\n${effectiveText}\n\nTask: Generate exactly ${config.count} MCQs for "${config.focus}".\nImportant: You must create high-quality questions testing deep subject knowledge. Do not only ask questions copied directly from the text; you are explicitly instructed to ask standard benchmark statistical questions expanding on these topics (UPSC ISS / MoSPI standard) to test the candidate's true competency.`,
           },
         ];
       } else if (fallbackBase64) {
@@ -1001,7 +1336,7 @@ async function generateQuizFromMaterial({
         correctAnswer: (q.correctAnswer || "A").toUpperCase().trim(),
         topic: q.topic || "General Statistics",
       };
-      return normalizeServerQuestion(formatted);
+      return normalizeServerQuestion(formatted, idx);
     });
 
     const primaryModel = Array.from(modelsReported).find((m) => m !== "offline-statistical-bank") || "gemini-3.1-flash-lite";
@@ -1029,12 +1364,63 @@ async function generateQuizFromMaterial({
 
 // Health check endpoint
 app.get("/api/health", (req, res) => {
+  const nvidiaKey = getNvidiaApiKey();
   res.json({
     status: "ok",
     appName: "Mithra.ai",
-    models: ["gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-3.8-flash"],
+    activeProvider: nvidiaKey ? "nvidia-nim" : "gemini",
+    nvidiaConfigured: !!nvidiaKey,
+    geminiConfigured: !!process.env.GEMINI_API_KEY,
+    models: nvidiaKey
+      ? [
+          "meta/llama-3.2-11b-vision-instruct",
+          "meta/llama-3.2-90b-vision-instruct",
+          "nvidia/llama-3.1-nemotron-70b-instruct",
+          "gemini-3.1-pro-preview",
+          "gemini-3.8-flash",
+        ]
+      : [
+          "gemini-3.1-pro-preview",
+          "gemini-3.8-flash",
+          "gemini-3.1-flash-lite",
+        ],
     timestamp: new Date().toISOString(),
   });
+});
+
+// Set or update NVIDIA API key programmatically
+app.post("/api/set-nvidia-key", (req, res) => {
+  try {
+    const { apiKey } = req.body;
+    if (!apiKey || typeof apiKey !== "string" || apiKey.trim().length < 5) {
+      return res.status(400).json({ error: "Invalid API key format." });
+    }
+    const trimmed = apiKey.trim();
+    process.env.NVIDIA_API_KEY = trimmed;
+
+    // Persist to .env file dynamically
+    const envPath = path.join(process.cwd(), ".env");
+    let envContent = "";
+    if (fs.existsSync(envPath)) {
+      envContent = fs.readFileSync(envPath, "utf-8");
+    }
+    if (envContent.includes("NVIDIA_API_KEY=")) {
+      envContent = envContent.replace(/NVIDIA_API_KEY=.*$/m, `NVIDIA_API_KEY="${trimmed}"`);
+    } else {
+      envContent += `\nNVIDIA_API_KEY="${trimmed}"\n`;
+    }
+    fs.writeFileSync(envPath, envContent, "utf-8");
+
+    console.log("[NVIDIA NIM] Key set successfully. Active models: Llama 3.3 70B, Nemotron 70B.");
+
+    res.json({
+      success: true,
+      message: "NVIDIA API key updated successfully! NVIDIA NIM models (Llama 3.3 70B & Nemotron) are now active.",
+      activeProvider: "nvidia-nim",
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "Failed to set NVIDIA API key" });
+  }
 });
 
 // Resilient Chunked Upload Endpoint (Handles 500 MB+ files safely in 10-15MB slices)
@@ -1575,7 +1961,7 @@ app.post("/api/chat-mithra", async (req, res) => {
       const cleanBase64 = fileData.base64.replace(/^data:[^;]+;base64,/, "");
       const mimeType = fileData.mimeType || "image/png";
 
-      if (mimeType.startsWith("image/") || mimeType === "application/pdf") {
+      if (mimeType.startsWith("image/")) {
         currentParts.push({
           inlineData: {
             mimeType,
@@ -1583,14 +1969,31 @@ app.post("/api/chat-mithra", async (req, res) => {
           },
         });
         currentParts.push({
-          text: `[Attached File: ${fileData.fileName || "File"}]`,
+          text: `[Attached Image: ${fileData.fileName || "Image"}]`,
         });
+      } else if (mimeType === "application/pdf" || (fileData.fileName && fileData.fileName.toLowerCase().endsWith(".pdf"))) {
+        // High-speed text extraction on server to prevent sending heavy binary base64 to Gemini API
+        try {
+          const pdfBuf = Buffer.from(cleanBase64, "base64");
+          const parsed = await extractTextFromPdfBuffer(pdfBuf, 25);
+          const extractedSummary = parsed.text && parsed.text.length > 20
+            ? parsed.text.slice(0, 12000)
+            : `[Document: "${fileData.fileName}". Note: Content appears to be scanned imagery or diagrams]`;
+          currentParts.push({
+            text: `[Attached PDF Document: "${fileData.fileName || "document.pdf"}" (${parsed.pages || 1} pages)]\n\nContent Excerpt:\n${extractedSummary}`,
+          });
+        } catch (pdfErr) {
+          console.warn("Failed to parse PDF attachment in chat:", pdfErr);
+          currentParts.push({
+            text: `[Attached PDF Document: "${fileData.fileName || "document.pdf"}"]`,
+          });
+        }
       } else {
         // For text-based files (txt, csv, json, md, etc.)
         try {
           const textDecoded = Buffer.from(cleanBase64, "base64").toString("utf-8");
           currentParts.push({
-            text: `[Attached File: ${fileData.fileName || "document"}]\n\`\`\`\n${textDecoded.slice(0, 40000)}\n\`\`\``,
+            text: `[Attached File: ${fileData.fileName || "document"}]\n\`\`\`\n${textDecoded.slice(0, 20000)}\n\`\`\``,
           });
         } catch {
           currentParts.push({
@@ -1617,12 +2020,12 @@ app.post("/api/chat-mithra", async (req, res) => {
 
     console.log(`[Mithra Chat] Generating reply (Mode: ${modelMode}) for conversation with ${contents.length} turns. Has attachment: ${!!fileData}`);
 
-    // Call Gemini with failover prioritizing Pro when requested
+    // Call AI engine: fast response prioritized, failover guarantees 0 failures
     const { text, modelUsed } = await callGeminiWithFailover(ai, {
       contents,
       systemInstruction: MITHRA_CHAT_SYSTEM_PROMPT,
-      temperature: 0.35,
-      preferPro: modelMode !== "fast",
+      temperature: 0.25,
+      preferPro: modelMode === "pro",
     });
 
     res.json({

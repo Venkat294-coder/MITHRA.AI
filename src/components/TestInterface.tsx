@@ -153,9 +153,22 @@ export const TestInterface: React.FC<TestInterfaceProps> = ({
                   Question {currentIndex + 1} of {totalQuestions}
                 </span>
               </div>
-              <span className="px-3 py-1 rounded-full bg-slate-100 border border-slate-200 text-slate-700 text-xs font-semibold">
-                Topic: {currentQ.topic || "Statistical Methodology"}
-              </span>
+              <div className="flex items-center gap-2">
+                {currentQ.difficulty && (
+                  <span className={`px-2.5 py-1 rounded-full text-xs font-bold border ${
+                    currentQ.difficulty.toLowerCase() === "easy"
+                      ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                      : currentQ.difficulty.toLowerCase() === "hard"
+                      ? "bg-rose-50 text-rose-700 border-rose-200"
+                      : "bg-amber-50 text-amber-700 border-amber-200"
+                  }`}>
+                    {currentQ.difficulty.toLowerCase() === "easy" ? "🟢 Easy" : currentQ.difficulty.toLowerCase() === "hard" ? "🔴 Hard" : "🟡 Medium"}
+                  </span>
+                )}
+                <span className="px-3 py-1 rounded-full bg-slate-100 border border-slate-200 text-slate-700 text-xs font-semibold">
+                  Topic: {currentQ.topic || "Statistical Methodology"}
+                </span>
+              </div>
             </div>
 
             {/* Question Text */}
@@ -298,9 +311,22 @@ export const TestInterface: React.FC<TestInterfaceProps> = ({
                     Question {index + 1}
                   </span>
                 </div>
-                <span className="px-2.5 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-slate-700 text-xs font-medium">
-                  {q.topic}
-                </span>
+                <div className="flex items-center gap-2">
+                  {q.difficulty && (
+                    <span className={`px-2 py-0.5 rounded-full text-[11px] font-bold border ${
+                      q.difficulty.toLowerCase() === "easy"
+                        ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                        : q.difficulty.toLowerCase() === "hard"
+                        ? "bg-rose-50 text-rose-700 border-rose-200"
+                        : "bg-amber-50 text-amber-700 border-amber-200"
+                    }`}>
+                      {q.difficulty.toLowerCase() === "easy" ? "🟢 Easy" : q.difficulty.toLowerCase() === "hard" ? "🔴 Hard" : "🟡 Medium"}
+                    </span>
+                  )}
+                  <span className="px-2.5 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-slate-700 text-xs font-medium">
+                    {q.topic}
+                  </span>
+                </div>
               </div>
 
               <h3 className="text-base md:text-lg font-bold text-slate-800">

@@ -70,11 +70,16 @@ export function resolveDetailedSolution(question: Question): DetailedSolution {
       ? ds.whyCorrect
       : `Option ${correctAnswer} is correct ("${correctOptionText}"). ${explanation || "This aligns with official definitions and verified principles."}`;
 
+    const laymanExplanationText = ds.laymanExplanation && ds.laymanExplanation.trim().length > 10
+      ? ds.laymanExplanation
+      : `In simple terms: Remember that ${correctOptionText} is the standard established answer for this concept. When encountering this in tests, connect it directly to ${topic || "this topic"}.`;
+
     return {
       ...ds,
       type: isNumerical ? "numerical" : "theoretical",
       formulaUsed: cleanFormula,
       whyCorrect: whyCorrectText,
+      laymanExplanation: laymanExplanationText,
       conceptualExplanation: ds.conceptualExplanation || explanation,
     };
   }
@@ -84,6 +89,7 @@ export function resolveDetailedSolution(question: Question): DetailedSolution {
     let formula: string | undefined = undefined;
     let givenData = "Parameters and numerical conditions specified in the problem statement.";
     const steps: string[] = [];
+    let laymanExplanation = `In plain English: Calculate this by identifying the formula, plugging in the given numbers, and verifying that Option ${correctAnswer} matches your result.`;
 
     // Detect standard syllabus formulas
     if (qText.includes("SRSWOR") || qText.includes("SRSWR") || explanation.includes("Var(ȳ)")) {
@@ -93,6 +99,7 @@ export function resolveDetailedSolution(question: Question): DetailedSolution {
       steps.push("Step 2 (Evaluate FPC): Because 0 < f < 1 for a finite sample (n > 1), the factor (1 - f) is strictly less than 1.");
       steps.push("Step 3 (Comparison with SRSWR): In SRSWR, replacement means Var(ȳ) = σ²/n. Therefore, SRSWOR variance is strictly smaller and more precise.");
       steps.push(`Step 4 (Conclusion): Matches Option ${correctAnswer} ("${correctOptionText}").`);
+      laymanExplanation = "Think of it like picking marbles from a bag without putting them back: because you never test the same marble twice, each pick gives you 100% fresh information, making your estimate sharper and less variable than putting them back!";
     } else if (qText.includes("Neyman") || qText.includes("optimum allocation")) {
       formula = "n_i = n \\cdot \\frac{N_i \\cdot S_i}{\\sum_{k=1}^{L} (N_k \\cdot S_k)}";
       givenData = "Stratified population with L strata, stratum sizes N_i, stratum standard deviations S_i, and fixed total sample size n.";
@@ -100,18 +107,21 @@ export function resolveDetailedSolution(question: Question): DetailedSolution {
       steps.push("Step 2 (Proportionality): Sample allocation is proportional to the product of stratum size and stratum variability: n_i ∝ N_i * S_i.");
       steps.push("Step 3 (Evaluation): Larger and more heterogeneous strata receive larger sample allocations.");
       steps.push(`Step 4 (Conclusion): Confirms Option ${correctAnswer} ("${correctOptionText}").`);
+      laymanExplanation = "If one group of people has wildly varying incomes while another group all earn nearly the same, you should interview more people from the unpredictable group to get an accurate overall average!";
     } else if (qText.includes("Fisher") || qText.includes("Time Reversal") || qText.includes("Factor Reversal")) {
       formula = "I_F = \\sqrt{I_L \\times I_P} = \\sqrt{\\frac{\\sum p_1 q_0}{\\sum p_0 q_0} \\times \\frac{\\sum p_1 q_1}{\\sum p_0 q_1}}";
       givenData = "Base period (0) and current period (1) price and quantity data.";
       steps.push("Step 1 (Definition): Fisher's Ideal Index is the geometric mean of the Laspeyres index (I_L) and Paasche index (I_P).");
       steps.push("Step 2 (Test Axioms): It satisfies both the Time Reversal Test (I_01 * I_10 = 1) and the Factor Reversal Test (P_01 * Q_01 = V_01).");
       steps.push(`Step 3 (Verification): Directly validates Option ${correctAnswer} ("${correctOptionText}").`);
+      laymanExplanation = "Laspeyres tends to overstate inflation, while Paasche understates it. Fisher combines them by taking their geometric average, giving a perfectly balanced measure that passes every consistency test!";
     } else if (qText.includes("Deflator") || qText.includes("Real GDP") || qText.includes("Nominal GDP")) {
       formula = "\\text{GDP Deflator} = \\left( \\frac{\\text{Nominal GDP}}{\\text{Real GDP}} \\right) \\times 100";
       givenData = "Nominal GDP (current prices) and Real GDP (base-year constant prices).";
       steps.push("Step 1 (Concept): The GDP deflator measures price level changes across all domestically produced goods and services.");
       steps.push("Step 2 (Calculation): Divide Nominal GDP by Real GDP and multiply by 100.");
       steps.push(`Step 3 (Conclusion): Confirms Option ${correctAnswer} ("${correctOptionText}").`);
+      laymanExplanation = "Nominal GDP reflects current price tags, while Real GDP reflects actual physical goods produced. Dividing them strips out pure inflation so you know how much prices have actually risen across the entire economy!";
     } else {
       // General numerical solving without placeholder text
       givenData = "Values and parameters given in the question.";
@@ -127,6 +137,7 @@ export function resolveDetailedSolution(question: Question): DetailedSolution {
       steps,
       finalResult: `Option ${correctAnswer}: ${correctOptionText}`,
       whyCorrect: `Option ${correctAnswer} is correct ("${correctOptionText}"). ${explanation}`,
+      laymanExplanation,
     };
   } else {
     // Generate comprehensive theory-based explanation
@@ -143,6 +154,7 @@ export function resolveDetailedSolution(question: Question): DetailedSolution {
       whyCorrect: `Option ${correctAnswer} is correct: "${correctOptionText}". ${explanation}`,
       whyIncorrect: whyIncorrectParts,
       keyTakeaway: `Key Takeaway: Understand the exact definitions, statutory divisions, and foundational principles in ${topic || "Statistics"}.`,
+      laymanExplanation: `In plain English: ${explanation || `Option ${correctAnswer} is the verified official answer. Remember this connection for examination questions on ${topic || "this topic"}.`}`,
     };
   }
 }

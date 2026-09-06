@@ -220,6 +220,19 @@ export const QuestionReview: React.FC<QuestionReviewProps> = ({
                         {q.topic}
                       </span>
 
+                      {/* Difficulty Badge */}
+                      {q.difficulty && (
+                        <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-bold border ${
+                          q.difficulty.toLowerCase() === "easy"
+                            ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                            : q.difficulty.toLowerCase() === "hard"
+                            ? "bg-rose-50 text-rose-700 border-rose-200"
+                            : "bg-amber-50 text-amber-700 border-amber-200"
+                        }`}>
+                          {q.difficulty.toLowerCase() === "easy" ? "🟢 Easy" : q.difficulty.toLowerCase() === "hard" ? "🔴 Hard" : "🟡 Medium"}
+                        </span>
+                      )}
+
                       {/* Problem Category Badge */}
                       {isNumerical ? (
                         <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-sky-50 text-sky-700 border border-sky-200 text-[11px] font-bold">
@@ -367,6 +380,19 @@ export const QuestionReview: React.FC<QuestionReviewProps> = ({
                             />
                           </div>
                         </div>
+
+                        {/* PLAIN ENGLISH / LAYMAN EXPLANATION (EVERYONE CAN UNDERSTAND) */}
+                        {solution.laymanExplanation && (
+                          <div className="p-3.5 rounded-xl bg-teal-50/80 border border-teal-200 text-teal-950 space-y-1">
+                            <div className="font-bold text-teal-900 text-[11.5px] flex items-center gap-1.5">
+                              <Lightbulb className="w-3.5 h-3.5 text-teal-600" />
+                              <span>In Simple Terms (Plain-English Breakdown):</span>
+                            </div>
+                            <div className="text-teal-900 text-xs font-normal leading-relaxed pl-5">
+                              <FormattedMathContent text={solution.laymanExplanation} />
+                            </div>
+                          </div>
+                        )}
 
                         {/* CORE CONCEPT / SUMMARY */}
                         {solution.coreConcept && (

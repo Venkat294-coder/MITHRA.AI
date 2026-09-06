@@ -78,9 +78,9 @@ export default function App() {
       let data: any;
 
       if (file) {
-        // Strategy 1: For files <= 4 MB (the majority of test papers and notes), use direct single-request upload
-        // This avoids chunk roundtrips, proxy 413 limits, and multi-request serverless cache misses
-        if (file.size <= 4 * 1024 * 1024) {
+        // Strategy 1: For files <= 35 MB (covers 99% of lecture notes, textbooks, and reports), use direct single-request upload
+        // This completely eliminates multi-chunk upload network errors, proxy timeouts, and roundtrip latency
+        if (file.size <= 35 * 1024 * 1024) {
           const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
           setUploadProgress(30);
           setLoadingStep(`Uploading "${file.name}" (${sizeMb} MB) & analyzing statistical syllabus...`);
@@ -89,17 +89,17 @@ export default function App() {
           formData.append("file", file);
           formData.append("fileName", file.name);
           formData.append("numQuestions", String(numQuestions));
-          if (base64Data) {
+          if (base64Data && file.size <= 10 * 1024 * 1024) {
             formData.append("base64Data", base64Data);
           }
 
           setUploadProgress(60);
           setLoadingStep(
             numQuestions === 30
-              ? `Formulating 30 MCQs across 3 parallel AI engines (Theory, Formulas & Competitive Benchmarks)...`
+              ? `Formulating 30 MCQs (Theory, Formulas & Competitive Benchmarks)...`
               : numQuestions === 20
-              ? `Formulating 20 MCQs across dual parallel streams (PDF Concepts + Statistical Benchmark Standards)...`
-              : `Formulating 10 high-yield MCQs (Synthesizing PDF and Official Statistical Benchmarks)...`
+              ? `Formulating 20 MCQs (PDF Concepts + Statistical Benchmark Standards)...`
+              : `Formulating 10 high-yield MCQs (Synthesizing PDF & Statistical Benchmarks)...`
           );
 
           const genRes = await fetch("/api/generate-quiz", {
@@ -115,7 +115,7 @@ export default function App() {
 
           data = await genRes.json();
         } else {
-          // Strategy 2: For larger files (> 4 MB), perform fast client-side parsing first
+          // Strategy 2: For extra-large volumes (> 35 MB up to 650 MB), perform fast client-side parsing first
           const sizeMb = (file.size / (1024 * 1024)).toFixed(1);
           setLoadingStep(`Extracting text from high-capacity PDF "${file.name}" (${sizeMb} MB)...`);
           setUploadProgress(25);
