@@ -274,15 +274,22 @@ export const MithraChatbot: React.FC<MithraChatbotProps> = ({ initialOpen = fals
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          Accept: "application/json",
         },
         body: JSON.stringify(payload),
       });
 
-      if (!response.ok) {
-        throw new Error(`Server responded with status ${response.status}`);
+      const rawText = await response.text();
+      let data: any = {};
+      try {
+        data = JSON.parse(rawText);
+      } catch {
+        throw new Error("Received non-JSON response from chat service");
       }
 
-      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data?.error || `Server responded with status ${response.status}`);
+      }
 
       const modelMsg: ChatMessage = {
         id: `msg_${Date.now()}_model`,
